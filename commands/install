@@ -16,8 +16,11 @@ install_dependency() {
         # Special cases: mariadb doesn't support --version, and wp's shebang
         # uses /usr/bin/env php which won't resolve since Cove no longer
         # installs a standalone php (wp-cli is invoked through frankenphp
-        # php-cli at runtime — see get_wp_cmd in main).
-        if [[ "$cmd_name" == "mariadb" || "$cmd_name" == "wp" ]] || "$cmd_name" --version &>/dev/null 2>&1; then
+        # php-cli at runtime — see get_wp_cmd in main). mailpit has
+        # `mailpit version` and rejects --version.
+        if [[ "$cmd_name" == "mariadb" || "$cmd_name" == "wp" ]] \
+            || { [ "$cmd_name" == "mailpit" ] && mailpit version &>/dev/null; } \
+            || "$cmd_name" --version &>/dev/null 2>&1; then
             echo "✅ $cmd_name is already installed and valid."
             return 0
         fi
@@ -34,9 +37,22 @@ install_dependency() {
     local pkg_name=""
 
     # 2. Attempt installation with the native package manager.
+    # On macOS, a tool that publishes its own builds comes from there on an
+    # Intel Mac (where Homebrew would compile it), and anywhere brew fails.
     if [ "$OS" == "macos" ]; then
-        if "$MAC_BREW" install "$brew_pkg"; then
-            installed_successfully=true
+        local has_release=false
+        mac_release_url "$cmd_name" &>/dev/null && has_release=true
+        if [ "$IS_INTEL_MAC" = true ] && $has_release; then
+            echo "   - Homebrew has no Intel builds; using $cmd_name's own release."
+            mac_install_release_binary "$cmd_name" && installed_successfully=true
+        fi
+        if [ "$installed_successfully" = false ]; then
+            if mac_brew_install "$brew_pkg"; then
+                installed_successfully=true
+            elif $has_release && [ "$IS_INTEL_MAC" != true ]; then
+                echo "   - '$MAC_BREW install $brew_pkg' failed; using $cmd_name's own release."
+                mac_install_release_binary "$cmd_name" && installed_successfully=true
+            fi
         fi
     else # For Linux (apt/dnf)
         # Determine the correct package name for this distro
@@ -481,8 +497,18 @@ cove_install() {
         fi
     fi
 
-    # MariaDB - Database server
-    install_dependency "mariadb" "mariadb" "mariadb-server" "mariadb-server" ""
+    # MariaDB - Database server. On macOS, whichever formula is installed
+    # already, else mariadb (mariadb@10.5 on an Intel Mac): see
+    # cove_mariadb_formula. Versioned formulas are keg-only, so their tools
+    # go on PATH for the rest of the install.
+    local mariadb_formula="mariadb"
+    [ "$OS" == "macos" ] && mariadb_formula=$(cove_mariadb_formula)
+    install_dependency "mariadb" "$mariadb_formula" "mariadb-server" "mariadb-server" ""
+    if [ "$OS" == "macos" ] && ! command -v mysqladmin &>/dev/null; then
+        local mariadb_keg_bin="${BIN_DIR%/bin}/opt/$mariadb_formula/bin"
+        [ -d "$mariadb_keg_bin" ] && export PATH="$mariadb_keg_bin:$PATH"
+        hash -r
+    fi
     # Pin portable collation defaults before the first start (see
     # write_mariadb_config in main for the MariaDB 11.5+ uca1400 trap).
     write_mariadb_config || true
@@ -493,8 +519,9 @@ cove_install() {
     # above provide WordPress's required extensions to FrankenPHP.
 
     # Mailpit - Email testing tool.
-    # On macOS we use the Homebrew formula. On Linux we use the upstream
-    # installer because mailpit isn't packaged in apt/dnf.
+    # On macOS we use the Homebrew formula (its release build on an Intel
+    # Mac). On Linux we use the upstream installer because mailpit isn't
+    # packaged in apt/dnf.
     # Why: the upstream installer hardcodes /usr/local/bin, which doesn't
     # exist on a fresh Apple Silicon Mac (Homebrew lives at /opt/homebrew).
     if [ "$OS" == "macos" ]; then

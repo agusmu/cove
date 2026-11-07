@@ -74,11 +74,15 @@ setup_environment() {
         OS="macos"
         PKG_MANAGER="brew"
         
-        # Architecture detection for MacOS Homebrew paths
-        if [ "$(uname -m)" = "arm64" ]; then
+        # Architecture detection for MacOS Homebrew paths. Under Rosetta an
+        # Apple Silicon Mac reports x86_64, so ask whether we're translated.
+        if [ "$(uname -m)" = "arm64" ] || [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
             INSTALL_DIR="/opt/homebrew/bin"
         else
             INSTALL_DIR="/usr/local/bin"
+            echo_info "Intel Mac detected. Homebrew no longer publishes Intel packages, so Cove downloads"
+            echo_info "gum, Mailpit and WP-CLI from their own releases and uses Homebrew's mariadb@10.5,"
+            echo_info "which still has an Intel bottle. Nothing is compiled from source."
         fi
         
         echo_success "Detected $OS with $PKG_MANAGER. Install path set to '$INSTALL_DIR'."

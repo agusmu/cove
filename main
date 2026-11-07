@@ -28,6 +28,10 @@ PKG_MANAGER=""
 MAC_BREW=""
 SUDO_CMD="sudo"
 IS_WSL=false
+# An Intel Mac. Homebrew stopped building bottles for it in September 2026
+# (Tier 3), so every formula it installs there compiles from source; Cove
+# fetches the tools that ship their own macOS builds from their releases.
+IS_INTEL_MAC=false
 BIN_DIR="/usr/local/bin"
 
 setup_environment() {
@@ -62,11 +66,26 @@ setup_environment() {
                 ;;
         esac
 
-        # Architecture detection for MacOS Homebrew paths
-        if [ "$(uname -m)" = "arm64" ]; then
+        # Architecture detection for MacOS Homebrew paths. A shell running
+        # under Rosetta reports x86_64 on Apple Silicon, so ask the kernel
+        # whether this process is translated before calling the Mac Intel.
+        if [ "$(uname -m)" = "arm64" ] || [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
             BIN_DIR="/opt/homebrew/bin"
         else
             BIN_DIR="/usr/local/bin"
+            IS_INTEL_MAC=true
+        fi
+
+        # Homebrew's versioned MariaDB formulas (mariadb@10.5 and the like)
+        # are keg-only, so their mariadb, mysqladmin and mariadb-dump aren't
+        # on PATH unless linked by hand.
+        if ! command -v mariadb &>/dev/null; then
+            local keg
+            keg=$(cove_mariadb_formula)
+            if [ -d "${BIN_DIR%/bin}/opt/$keg/bin" ]; then
+                PATH="${BIN_DIR%/bin}/opt/$keg/bin:$PATH"
+                export PATH
+            fi
         fi
 
         return 0 # Success, exit function
@@ -134,6 +153,115 @@ pkg_service() {
     brew services "${args[@]}"
 }
 
+# The Homebrew formula that provides MariaDB on macOS, which is also its
+# `brew services` name: COVE_MARIADB_FORMULA when set, else the one installed
+# (mariadb, or the newest mariadb@<version>), else what `cove install` puts
+# in: mariadb on Apple Silicon, mariadb@10.5 on an Intel Mac, the one MariaDB
+# formula Homebrew still has an Intel bottle for. Read from the filesystem,
+# never `brew list`, which takes seconds.
+cove_mariadb_formula() {
+    if [ -n "${COVE_MARIADB_FORMULA:-}" ]; then
+        echo "$COVE_MARIADB_FORMULA"
+        return
+    fi
+    if [ "$MAC_BREW" = "brew" ]; then
+        local opt="${BIN_DIR%/bin}/opt" keg newest=""
+        if [ -d "$opt/mariadb/bin" ]; then
+            echo "mariadb"
+            return
+        fi
+        for keg in "$opt"/mariadb@*; do
+            [ -d "$keg/bin" ] && newest="$newest${newest:+$'\n'}$(basename "$keg")"
+        done
+        if [ -n "$newest" ]; then
+            printf '%s\n' "$newest" | sort -V | tail -n 1
+            return
+        fi
+    fi
+    if [ "$IS_INTEL_MAC" = true ] && [ "$MAC_BREW" = "brew" ]; then
+        echo "mariadb@10.5"
+    else
+        echo "mariadb"
+    fi
+}
+
+# `$MAC_BREW install` for Cove's own installs. On an Intel Mac Homebrew has
+# no new bottles, so a formula without one would be compiled from source, for
+# anything from ten minutes to hours. Cove never does that: --force-bottle
+# makes brew use a bottle or fail, and nothing already installed is upgraded
+# (an upgrade of a dependency would need a bottle that isn't there).
+mac_brew_install() {
+    local formula="$1"
+    if [ "$OS" = "macos" ] && [ "$IS_INTEL_MAC" = true ] && [ "$MAC_BREW" = "brew" ]; then
+        if HOMEBREW_NO_INSTALL_UPGRADE=1 HOMEBREW_NO_AUTO_UPDATE=1 brew install --force-bottle "$formula"; then
+            return 0
+        fi
+        echo "   ❌ Homebrew has no prebuilt Intel package for $formula, and Cove doesn't compile from source." >&2
+        return 1
+    fi
+    "$MAC_BREW" install "$formula"
+}
+
+# A macOS download for a tool that publishes its own builds, for this Mac's
+# architecture: where Homebrew has no bottle (an Intel Mac) these replace a
+# source build, and elsewhere they back up a `brew install` that fails.
+# Empty, and non-zero, for anything else.
+mac_release_url() {
+    local cmd="$1" arch="arm64" goarch="arm64" ver
+    if [ "$IS_INTEL_MAC" = true ]; then
+        arch="x86_64"
+        goarch="amd64"
+    fi
+    case "$cmd" in
+        gum)
+            # gum's asset names carry the version, so latest/download can't name them.
+            ver=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/charmbracelet/gum/releases/latest 2>/dev/null | sed -n 's|.*/tag/v||p')
+            [ -n "$ver" ] || return 1
+            echo "https://github.com/charmbracelet/gum/releases/download/v${ver}/gum_${ver}_Darwin_${arch}.tar.gz"
+            ;;
+        mailpit) echo "https://github.com/axllent/mailpit/releases/latest/download/mailpit-darwin-${goarch}.tar.gz" ;;
+        cloudflared) echo "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${goarch}.tgz" ;;
+        wp) echo "https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Download $1 from mac_release_url into $BIN_DIR. Archives are unpacked and
+# the binary of that name taken out of them. $BIN_DIR is Homebrew's and this
+# user's on a Mac with Homebrew, and root's (sudo) on one without it.
+mac_install_release_binary() {
+    local cmd="$1" url tmp bin
+    url=$(mac_release_url "$cmd") || { echo "   - No release download is known for $cmd." >&2; return 1; }
+    tmp=$(mktemp -d) || return 1
+    echo "   - Downloading $cmd from ${url%%/releases/*}..."
+    if [[ "$url" == *.tar.gz || "$url" == *.tgz ]]; then
+        if ! curl -fsSL "$url" | tar -xz -C "$tmp"; then
+            rm -rf "$tmp"
+            return 1
+        fi
+        bin=$(find "$tmp" -name "$cmd" -type f 2>/dev/null | head -n 1)
+    else
+        curl -fsSL "$url" -o "$tmp/$cmd" && bin="$tmp/$cmd"
+    fi
+    if [ -z "$bin" ] || [ ! -s "$bin" ]; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    chmod 755 "$bin"
+    local sudo_cmd=""
+    if [ ! -d "$BIN_DIR" ] && ! mkdir -p "$BIN_DIR" 2>/dev/null; then
+        sudo mkdir -p "$BIN_DIR" || { rm -rf "$tmp"; return 1; }
+    fi
+    [ -w "$BIN_DIR" ] || sudo_cmd="sudo"
+    if ! $sudo_cmd mv -f "$bin" "$BIN_DIR/$cmd"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    hash -r
+    return 0
+}
+
 # Block until MariaDB accepts connections, or give up after $1 seconds.
 mariadb_wait_ready() {
     local max="${1:-10}" i=0
@@ -151,14 +279,16 @@ mariadb_wait_ready() {
 # service starts yet never accepts connections. Detect that, run
 # mariadb-install-db ourselves, and restart. The Homebrew path is unchanged.
 start_macos_mariadb() {
-    pkg_service restart mariadb || return 1
+    local formula
+    formula=$(cove_mariadb_formula)
+    pkg_service restart "$formula" || return 1
 
     if [ "$MAC_BREW" = "nb" ] && ! mariadb_wait_ready 8; then
         echo "   - Initializing MariaDB data directory (nanobrew post_install fallback)..."
         if command -v mariadb-install-db &>/dev/null; then
             mariadb-install-db &>/dev/null || true
         fi
-        pkg_service restart mariadb || return 1
+        pkg_service restart "$formula" || return 1
     fi
     return 0
 }
@@ -1726,7 +1856,7 @@ cove_pg_setup() {
         else
             if ! cove_pg_tool pg_ctl >/dev/null 2>&1 || ! "$MAC_BREW" list "$COVE_PG_FORMULA" >/dev/null 2>&1; then
                 echo "   - Installing $COVE_PG_FORMULA (a few minutes the first time)…"
-                if ! "$MAC_BREW" install "$COVE_PG_FORMULA" >&2; then
+                if ! mac_brew_install "$COVE_PG_FORMULA" >&2; then
                     echo "❌ Error: Could not install $COVE_PG_FORMULA." >&2
                     return 1
                 fi
@@ -1873,7 +2003,7 @@ ensure_redis() {
     elif [ "$OS" = "macos" ]; then
         if ! "$MAC_BREW" list redis >/dev/null 2>&1; then
             echo "   - Installing redis…"
-            "$MAC_BREW" install redis >&2 || { echo "❌ Error: Could not install redis." >&2; return 1; }
+            mac_brew_install redis >&2 || { echo "❌ Error: Could not install redis." >&2; return 1; }
         fi
         config_set REDIS_FORMULA redis
         pkg_service start redis >/dev/null 2>&1
@@ -2250,7 +2380,7 @@ shell_quote() {
 # Different distros may use 'mariadb', 'mysql', or 'mysqld' as the service name
 get_mariadb_service_name() {
     if [ "$OS" == "macos" ]; then
-        echo "mariadb"
+        cove_mariadb_formula
         return
     fi
     # Check which service name exists on this system
@@ -18977,6 +19107,12 @@ display_command_help() {
             echo "from its GitHub release, for Apple Silicon and Intel); Linux uses apt or"
             echo "dnf. It also sets up ~/Cove. PostgreSQL and Redis are optional and set up"
             echo "when a Laravel site needs them (see cove postgres, cove redis)."
+            echo ""
+            echo "On an Intel Mac, where Homebrew no longer publishes packages, gum, Mailpit"
+            echo "and WP-CLI come from their own releases and MariaDB is Homebrew's"
+            echo "mariadb@10.5, the one it still has an Intel bottle for. Cove never compiles"
+            echo "from source. A MariaDB formula that's already installed is used instead;"
+            echo "set COVE_MARIADB_FORMULA=<formula> to choose one."
             echo ""
             echo "Options:"
             echo "  --yes, -y, --force   Skip confirmation prompts for scripted installs."

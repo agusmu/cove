@@ -53,7 +53,7 @@ Run the following in your terminal to install `cove`.
 bash <(curl -fsSL https://cove.run/install-cove.sh)
 ```
 
-On macOS (Apple Silicon or Intel), the installer will offer to install Homebrew first if it's not already present. On Linux (Ubuntu, Debian, Fedora, Rocky Linux/RHEL), make sure `curl` is installed before running it.
+On macOS (Apple Silicon or Intel), the installer will offer to install Homebrew first if it's not already present. Homebrew stopped publishing Intel packages in September 2026, so on an Intel Mac Cove downloads gum, Mailpit, WP-CLI and cloudflared from their own releases and uses Homebrew's `mariadb@10.5`, the one MariaDB formula that still has an Intel bottle (a MariaDB formula you already have is used as it is, and `COVE_MARIADB_FORMULA=<formula> cove install` picks another). Cove never compiles from source: per-site PHP, PostgreSQL and Redis install only if Homebrew has a prebuilt Intel package for them, and say so if it doesn't. On Linux (Ubuntu, Debian, Fedora, Rocky Linux/RHEL), make sure `curl` is installed before running it.
 
 To preview an unreleased build from the `main` branch — useful for verifying a fix before it's tagged — pass `--main`. The installer downloads the main branch and builds `cove.sh` from its source:
 

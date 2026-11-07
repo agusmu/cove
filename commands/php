@@ -34,7 +34,7 @@ ensure_php_formula() {
     else
         echo "   Installing php@$ver via Homebrew..."
     fi
-    if ! brew install "php@$ver"; then
+    if ! mac_brew_install "php@$ver"; then
         gum style --foreground red "❌ Error: 'brew install php@$ver' failed."
         return 1
     fi
