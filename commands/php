@@ -2,18 +2,34 @@
 #
 # FrankenPHP (bundling the latest PHP) stays the front door for every site.
 # Pinning a site to an older version swaps its Caddyfile handler from
-# php_server to php_fastcgi against a Cove-managed Homebrew php-fpm on a unix
-# socket. Service lifecycle + pool config live in main (write_php_fpm_config,
-# sync_php_fpm_services, emit_site_php_handler); this file is the CLI.
+# php_server to php_fastcgi against a Cove-managed php-fpm on a unix socket
+# (Homebrew's, or on an Intel Mac Cove's own prebuilt PHP). Service lifecycle
+# + pool config live in main (write_php_fpm_config, sync_php_fpm_services,
+# emit_site_php_handler); this file is the CLI.
 
-# Make sure php@<ver>'s php-fpm is available, offering a brew install when
-# the formula exists but isn't installed. Auto-confirms without a TTY so the
+# Make sure PHP <ver>'s php-fpm is available: downloaded on an Intel Mac, else
+# a brew install offered when the formula exists but isn't installed.
+# Auto-confirms without a TTY so the
 # dashboard and scripts can pin non-interactively. Returns non-zero when the
 # binary still can't be resolved — callers must not write a php_version file
 # in that case.
 ensure_php_formula() {
     local ver="$1"
     if [ -n "$(php_fpm_prefix_for "$ver")" ]; then
+        return 0
+    fi
+    # Intel Mac: Cove's own prebuilt PHP, never a Homebrew formula (which
+    # would be compiled from source there). See mac_install_static_php.
+    if [ "$OS" = "macos" ] && [ "$IS_INTEL_MAC" = true ]; then
+        echo "📦 PHP $ver is not installed."
+        if [ -t 0 ] && ! gum confirm "Download PHP $ver (about 70 MB, prebuilt) now?"; then
+            echo "Aborted."
+            return 1
+        fi
+        if ! mac_install_static_php "$ver" || [ -z "$(php_fpm_prefix_for "$ver")" ]; then
+            gum style --foreground red "❌ Error: Couldn't install PHP $ver."
+            return 1
+        fi
         return 0
     fi
     if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
@@ -65,7 +81,7 @@ cove_php_overview() {
             fi
         done
     fi
-    if [ "$OS" == "macos" ] && [ "$MAC_BREW" == "brew" ]; then
+    if [ "$OS" == "macos" ]; then
         echo ""
         local plist ver state found=false
         for plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do

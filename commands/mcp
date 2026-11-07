@@ -514,7 +514,7 @@ function tools(): array {
         ],
         'set_php' => [
             'title' => 'Set a site\'s PHP version',
-            'description' => "Pins a site to an older PHP (e.g. 8.2), served by a native php-fpm behind the same web server, or puts it back on Cove's bundled PHP with version default. For checking a plugin or theme on another PHP. macOS with Homebrew only; the first pin to a version installs php@<version>, which can take a few minutes.",
+            'description' => "Pins a site to an older PHP (e.g. 8.2), served by a native php-fpm behind the same web server, or puts it back on Cove's bundled PHP with version default. For checking a plugin or theme on another PHP. macOS only; the first pin to a version installs it (a prebuilt download on an Intel Mac, Homebrew's php@<version> otherwise), which can take a few minutes.",
             'inputSchema' => $obj(['site' => $site, 'version' => ['type' => 'string', 'description' => 'A PHP version such as 8.2 or 8.3, or default.']], ['site', 'version']),
             'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false],
         ],

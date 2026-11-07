@@ -262,6 +262,55 @@ mac_install_release_binary() {
     return 0
 }
 
+# PHP <ver> (8.0 to 8.5, as 8.2) for per-site pins, as a prebuilt static
+# build instead of a Homebrew php@<ver>, which on an Intel Mac would be
+# compiled from source. From static-php-cli's "bulk" set (dl.static-php.dev):
+# php-fpm and php-cli, each one self-contained file with everything WordPress
+# and most Laravel apps want (mysqli, pdo_mysql, intl, opcache, gd, imagick,
+# redis, sodium, curl, zip...), but no pdo_sqlite or pdo_pgsql. Laid out as
+# $COVE_PHP_DIR/<ver>/{sbin/php-fpm,bin/php}, which is Homebrew's layout, so
+# everything that takes a php_fpm_prefix_for result works unchanged. Intel
+# only: static builds aren't signed, which Apple Silicon requires.
+mac_install_static_php() {
+    local ver="$1" base="https://dl.static-php.dev/static-php-cli/bulk"
+    local listing fpm_file cli_file tmp dest="$COVE_PHP_DIR/$1"
+    if [ "$OS" != "macos" ] || [ "$IS_INTEL_MAC" != true ]; then
+        echo "❌ Cove's own PHP builds are for Intel Macs only." >&2
+        return 1
+    fi
+    echo "   - Looking up the newest PHP $ver build..."
+    listing=$(curl -fsSL "$base/" 2>/dev/null)
+    fpm_file=$(printf '%s' "$listing" | grep -oE "php-${ver//./\\.}\\.[0-9]+-fpm-macos-x86_64\\.tar\\.gz" | sort -uV | tail -n 1)
+    cli_file=$(printf '%s' "$listing" | grep -oE "php-${ver//./\\.}\\.[0-9]+-cli-macos-x86_64\\.tar\\.gz" | sort -uV | tail -n 1)
+    if [ -z "$fpm_file" ] || [ -z "$cli_file" ]; then
+        echo "❌ No prebuilt PHP $ver for Intel macOS at dl.static-php.dev (it has 8.0 to 8.5)." >&2
+        return 1
+    fi
+    tmp=$(mktemp -d) || return 1
+    mkdir -p "$tmp/fpm" "$tmp/cli"
+    echo "   - Downloading ${fpm_file%-fpm-*} (php-fpm and php, about 70 MB)..."
+    if ! curl -fsSL "$base/$fpm_file" | tar -xz -C "$tmp/fpm" \
+        || ! curl -fsSL "$base/$cli_file" | tar -xz -C "$tmp/cli" \
+        || [ ! -s "$tmp/fpm/php-fpm" ] || [ ! -s "$tmp/cli/php" ]; then
+        echo "❌ Couldn't download PHP $ver." >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    chmod 755 "$tmp/fpm/php-fpm" "$tmp/cli/php"
+    # Must run here and carry what WordPress needs, before it replaces anything.
+    if ! "$tmp/fpm/php-fpm" -v &>/dev/null || ! "$tmp/cli/php" -m 2>/dev/null | grep -qix mysqli; then
+        echo "❌ The PHP $ver download doesn't run on this Mac, or has no mysqli." >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    mkdir -p "$dest/sbin" "$dest/bin" || { rm -rf "$tmp"; return 1; }
+    # Renamed into place, so a php-fpm that's running keeps its own copy.
+    mv -f "$tmp/fpm/php-fpm" "$dest/sbin/php-fpm" && mv -f "$tmp/cli/php" "$dest/bin/php" || { rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
+    echo "   - ✅ $("$dest/bin/php" -r 'echo PHP_VERSION;') installed in $dest"
+    return 0
+}
+
 # Block until MariaDB accepts connections, or give up after $1 seconds.
 mariadb_wait_ready() {
     local max="${1:-10}" i=0
@@ -314,6 +363,7 @@ CUSTOM_CADDY_DIR="$APP_DIR/directives"
 # Per-site PHP version switching (native php-fpm behind FrankenPHP).
 RUN_DIR="$COVE_DIR/run"          # unix sockets: php-<ver>.sock
 PHP_FPM_DIR="$COVE_DIR/php-fpm"  # generated php-fpm configs: <ver>/php-fpm.conf
+COVE_PHP_DIR="$COVE_DIR/php-versions"  # Cove's own PHP builds: <ver>/sbin/php-fpm, <ver>/bin/php
 OPCACHE_EXCLUDE_FILE="$COVE_DIR/opcache-exclude.txt"  # cove opcache exclude
 
 PROTECTED_NAMES="cove"
@@ -520,15 +570,20 @@ site_php_version() {
     cat "$1/php_version" 2>/dev/null
 }
 
-# Homebrew prefix for php@<ver> (e.g. /opt/homebrew/opt/php@8.2), but only
-# when its php-fpm binary actually exists. Empty on nanobrew/Linux or when the
-# formula isn't installed — callers treat empty as "no native PHP available"
-# and fall back to FrankenPHP.
+# The prefix PHP <ver> runs from (with sbin/php-fpm and bin/php under it), but
+# only when its php-fpm binary actually exists: Cove's own build in
+# $COVE_PHP_DIR (see mac_install_static_php), else Homebrew's php@<ver>
+# (e.g. /opt/homebrew/opt/php@8.2). Empty on Linux, or when neither is
+# installed — callers treat empty as "no native PHP available" and fall back
+# to FrankenPHP.
 php_fpm_prefix_for() {
     local ver="$1"
-    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+    [ "$OS" = "macos" ] || return 0
+    if [ -x "$COVE_PHP_DIR/$ver/sbin/php-fpm" ]; then
+        echo "$COVE_PHP_DIR/$ver"
         return 0
     fi
+    [ "$MAC_BREW" = "brew" ] || return 0
     local prefix
     prefix=$(brew --prefix "php@$ver" 2>/dev/null)
     if [ -n "$prefix" ] && [ -x "$prefix/sbin/php-fpm" ]; then
@@ -3404,6 +3459,12 @@ write_php_fpm_config() {
     local mailpit_path
     mailpit_path=$(command -v mailpit)
     mkdir -p "$conf_dir" "$RUN_DIR" "$LOGS_DIR" "$COVE_DIR/cache/sessions"
+    # Cove's own static PHP has no php.ini, so no CA bundle to verify https
+    # with; macOS keeps one at /etc/ssl/cert.pem.
+    local cafile_lines=""
+    if [ -x "$COVE_PHP_DIR/$ver/sbin/php-fpm" ] && [ -f /etc/ssl/cert.pem ]; then
+        cafile_lines="php_admin_value[openssl.cafile] = /etc/ssl/cert.pem"$'\n'"php_admin_value[curl.cainfo] = /etc/ssl/cert.pem"
+    fi
     cat > "$conf_dir/php-fpm.conf" << EOM
 [global]
 ; Auto-generated by Cove (write_php_fpm_config in main). Do not edit —
@@ -3434,6 +3495,9 @@ php_admin_value[upload_max_filesize] = $(cove_ini_get upload_max_filesize 1G)
 php_admin_value[post_max_size] = $(cove_ini_get post_max_size 1G)
 php_admin_value[session.save_path] = $COVE_DIR/cache/sessions
 EOM
+    # Appended, not part of the template, so a Homebrew PHP's config stays
+    # byte for byte what it was (a changed one restarts the pool).
+    [ -n "$cafile_lines" ] && printf '%s\n' "$cafile_lines" >> "$conf_dir/php-fpm.conf"
     echo "$conf_dir/php-fpm.conf"
 }
 
@@ -3518,8 +3582,8 @@ sync_php_fpm_services() {
             [ -d "$site_path" ] || continue
             ver=$(site_php_version "$site_path")
             [ -n "$ver" ] || continue
-            if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
-                echo "   ⚠️  $(basename "$site_path") pins PHP $ver, but per-site PHP requires Homebrew on macOS; serving with FrankenPHP." >&2
+            if [ "$OS" != "macos" ]; then
+                echo "   ⚠️  $(basename "$site_path") pins PHP $ver, but per-site PHP is for macOS only; serving with FrankenPHP." >&2
                 continue
             fi
             case "$needed" in
@@ -3529,7 +3593,7 @@ sync_php_fpm_services() {
         done
     fi
 
-    if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
+    if [ "$OS" != "macos" ]; then
         return 0
     fi
 
@@ -6143,19 +6207,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         // Which PHP versions the dashboard can offer for per-site pins. The
         // dashboard itself runs under FrankenPHP, so PHP_VERSION here IS
         // Cove's default PHP — only OLDER versions run on native php-fpm.
-        // Installed = the Homebrew formula's php-fpm binary exists, mirroring
-        // php_fpm_prefix_for in the CLI.
+        // Installed = Cove's own build (~/Cove/php-versions, what an Intel Mac
+        // downloads) or the Homebrew formula's php-fpm binary exists,
+        // mirroring php_fpm_prefix_for in the CLI.
         $default_mm = preg_replace('/^(\d+\.\d+).*$/', '$1', PHP_VERSION);
         $brew_opt = is_dir('/opt/homebrew/opt') ? '/opt/homebrew/opt' : (is_dir('/usr/local/opt') ? '/usr/local/opt' : null);
-        $supported = (PHP_OS_FAMILY === 'Darwin') && $brew_opt !== null;
+        // An Intel Mac installs prebuilt PHP 8.0 to 8.5 itself, no Homebrew.
+        $own_php = $user_home . '/Cove/php-versions';
+        $intel_mac = PHP_OS_FAMILY === 'Darwin' && php_uname('m') === 'x86_64' && !is_dir('/opt/homebrew/opt');
+        $supported = (PHP_OS_FAMILY === 'Darwin') && ($brew_opt !== null || $intel_mac);
         $versions = [];
         foreach (['8.4', '8.3', '8.2', '8.1', '8.0', '7.4'] as $v) {
             if (version_compare($v, $default_mm, '>=')) continue;
-            $installed = $supported && is_executable($brew_opt . '/php@' . $v . '/sbin/php-fpm');
+            $installed = $supported && (is_executable($own_php . '/' . $v . '/sbin/php-fpm')
+                || ($brew_opt !== null && is_executable($brew_opt . '/php@' . $v . '/sbin/php-fpm')));
             // 8.0 and 7.4 left Homebrew core, so they can't be offered as
-            // one-click installs — but when a tap already provides them
-            // (shivammathur/php), pinning works, so show what's there.
-            if (!$installed && version_compare($v, '8.1', '<')) continue;
+            // one-click installs there — but when a tap already provides them
+            // (shivammathur/php), pinning works, so show what's there. The
+            // Intel downloads include 8.0.
+            if (!$installed && version_compare($v, $intel_mac ? '8.0' : '8.1', '<')) continue;
             $versions[] = ['version' => $v, 'installed' => $installed];
         }
         echo json_encode(['supported' => $supported, 'default' => $default_mm, 'versions' => $versions]);
@@ -7350,7 +7420,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
             }
             $brew_opt = is_dir('/opt/homebrew/opt') ? '/opt/homebrew/opt' : '/usr/local/opt';
-            $needs_install = $php_version !== 'default' && !is_executable($brew_opt . '/php@' . $php_version . '/sbin/php-fpm');
+            $needs_install = $php_version !== 'default'
+                && !is_executable($brew_opt . '/php@' . $php_version . '/sbin/php-fpm')
+                && !is_executable($user_home . '/Cove/php-versions/' . $php_version . '/sbin/php-fpm');
             // Always applied in the background — even an installed-version pin
             // regenerates the Caddyfile and reloads the Caddy serving this
             // dashboard, so a synchronous exec just hangs the response until
@@ -10645,7 +10717,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
     <div class="modal-backdrop" id="phpModal" style="display: none;">
         <div class="modal">
             <h3>PHP version <span class="modal-title-dim" id="phpModalSite"></span></h3>
-            <p class="modal-sub">Pinned sites run on a native Homebrew php-fpm behind FrankenPHP — TLS, logs and the URL stay the same.</p>
+            <p class="modal-sub">Pinned sites run on a native php-fpm behind FrankenPHP — TLS, logs and the URL stay the same.</p>
             <div class="php-options" id="phpOptions"></div>
             <template id="tpl-php-option">
                 <button type="button" class="php-option">
@@ -18193,7 +18265,7 @@ $__cove_demo = file_exists(getenv('HOME') . '/Cove/demo') ? (trim((string) @file
                     return;
                 }
                 if (res.installing) {
-                    this.showSnack('Installing PHP ' + version + ' via Homebrew — this can take a few minutes…', false, { duration: 300000 });
+                    this.showSnack('Installing PHP ' + version + ' — this can take a few minutes…', false, { duration: 300000 });
                 }
                 this.startPhpPoll(site.name, version, res.installing ? 15 * 60 * 1000 : 90 * 1000);
             },
@@ -19030,7 +19102,7 @@ show_general_help() {
     help_cmd login "Prints a one-time login link (WordPress or Laravel)."
     help_cmd path "Prints the path to a site's public folder."
     help_cmd url "Prints a site's HTTPS URL."
-    help_cmd php "Pins a site to an older PHP (macOS, with Homebrew)."
+    help_cmd php "Pins a site to an older PHP (macOS)."
     echo ""
     help_section "WordPress"
     help_cmd wp "Runs WP-CLI inside a site from anywhere."
@@ -19687,16 +19759,22 @@ display_command_help() {
         php)
             echo "Usage: cove php [<site>] [<version>|default|unpin]"
             echo ""
-            echo "Per-site PHP version switching, on macOS with Homebrew only. FrankenPHP"
-            echo "(bundling the latest PHP) serves every site by default; pinning a site"
-            echo "routes its PHP through a native Homebrew php-fpm (php@<version>) behind"
-            echo "Caddy via php_fastcgi. TLS, logs, mappings, and custom directives are"
-            echo "unaffected. On Linux every site runs on FrankenPHP's PHP."
+            echo "Per-site PHP version switching, on macOS only. FrankenPHP (bundling the"
+            echo "latest PHP) serves every site by default; pinning a site routes its PHP"
+            echo "through a native php-fpm behind Caddy via php_fastcgi. TLS, logs,"
+            echo "mappings, and custom directives are unaffected. On Linux every site runs"
+            echo "on FrankenPHP's PHP."
+            echo ""
+            echo "The php-fpm is Homebrew's php@<version> on Apple Silicon. On an Intel Mac,"
+            echo "where Homebrew would compile it, it's a prebuilt PHP 8.0 to 8.5 that Cove"
+            echo "downloads (about 70 MB) into ~/Cove/php-versions, with mysqli, intl,"
+            echo "opcache, gd, imagick, redis and the rest of WordPress's list, but no"
+            echo "pdo_sqlite or pdo_pgsql."
             echo ""
             echo "Commands:"
             echo "  cove php                 Overview: every site's effective PHP + services."
             echo "  cove php <site>          Show the site's effective PHP version."
-            echo "  cove php <site> 8.2      Pin the site to PHP 8.2 (installs php@8.2 if needed)."
+            echo "  cove php <site> 8.2      Pin the site to PHP 8.2 (installs it if needed)."
             echo "  cove php <site> default  Unpin — back to FrankenPHP's bundled PHP"
             echo "                           ('unpin' works too)."
             echo ""
@@ -22938,7 +23016,7 @@ cove_db_list() {
 #   cove db fix-collation <site> [--dry-run]
 #   cove db fix-collation --all  [--dry-run]
 if false; then : <<'exit 0'
-#############################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+##################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
  exit 0
 ########################################################################################################################################################################################################
  exit 0
@@ -28712,7 +28790,7 @@ function tools(): array {
         ],
         'set_php' => [
             'title' => 'Set a site\'s PHP version',
-            'description' => "Pins a site to an older PHP (e.g. 8.2), served by a native php-fpm behind the same web server, or puts it back on Cove's bundled PHP with version default. For checking a plugin or theme on another PHP. macOS with Homebrew only; the first pin to a version installs php@<version>, which can take a few minutes.",
+            'description' => "Pins a site to an older PHP (e.g. 8.2), served by a native php-fpm behind the same web server, or puts it back on Cove's bundled PHP with version default. For checking a plugin or theme on another PHP. macOS only; the first pin to a version installs it (a prebuilt download on an Intel Mac, Homebrew's php@<version> otherwise), which can take a few minutes.",
             'inputSchema' => $obj(['site' => $site, 'version' => ['type' => 'string', 'description' => 'A PHP version such as 8.2 or 8.3, or default.']], ['site', 'version']),
             'annotations' => ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false],
         ],
@@ -30342,6 +30420,15 @@ cove_opcache_configured() {
 
 # Restart FrankenPHP so a resized shared memory takes effect. `cove reload`
 # only re-reads the Caddyfile; PHP's SHM is allocated at process start.
+if false; then : <<'exit 0'
+#####################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+########################################################################################################################################################################################################
+ exit 0
+exit 0
+fi
 cove_opcache_restart() {
     if [ "$OS" = "macos" ]; then
         launchctl kickstart -k "gui/$(id -u)/com.cove.caddy" 2>/dev/null
@@ -30368,15 +30455,6 @@ cove_opcache_restart() {
 # while other threads still use the memory and aborts the process with
 # "zend_mm_heap corrupted" (php/php-src#22281). So what fills the arena, and
 # which site keeps recompiling, is worth seeing: `sites` and `--watch`.
-if false; then : <<'exit 0'
-#####################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-########################################################################################################################################################################################################
- exit 0
-exit 0
-fi
 cove_opcache_sites_probe_source() {
     cat <<'PHP'
 <?php
@@ -31026,18 +31104,34 @@ cove_path() {
 #
 # FrankenPHP (bundling the latest PHP) stays the front door for every site.
 # Pinning a site to an older version swaps its Caddyfile handler from
-# php_server to php_fastcgi against a Cove-managed Homebrew php-fpm on a unix
-# socket. Service lifecycle + pool config live in main (write_php_fpm_config,
-# sync_php_fpm_services, emit_site_php_handler); this file is the CLI.
+# php_server to php_fastcgi against a Cove-managed php-fpm on a unix socket
+# (Homebrew's, or on an Intel Mac Cove's own prebuilt PHP). Service lifecycle
+# + pool config live in main (write_php_fpm_config, sync_php_fpm_services,
+# emit_site_php_handler); this file is the CLI.
 
-# Make sure php@<ver>'s php-fpm is available, offering a brew install when
-# the formula exists but isn't installed. Auto-confirms without a TTY so the
+# Make sure PHP <ver>'s php-fpm is available: downloaded on an Intel Mac, else
+# a brew install offered when the formula exists but isn't installed.
+# Auto-confirms without a TTY so the
 # dashboard and scripts can pin non-interactively. Returns non-zero when the
 # binary still can't be resolved — callers must not write a php_version file
 # in that case.
 ensure_php_formula() {
     local ver="$1"
     if [ -n "$(php_fpm_prefix_for "$ver")" ]; then
+        return 0
+    fi
+    # Intel Mac: Cove's own prebuilt PHP, never a Homebrew formula (which
+    # would be compiled from source there). See mac_install_static_php.
+    if [ "$OS" = "macos" ] && [ "$IS_INTEL_MAC" = true ]; then
+        echo "📦 PHP $ver is not installed."
+        if [ -t 0 ] && ! gum confirm "Download PHP $ver (about 70 MB, prebuilt) now?"; then
+            echo "Aborted."
+            return 1
+        fi
+        if ! mac_install_static_php "$ver" || [ -z "$(php_fpm_prefix_for "$ver")" ]; then
+            gum style --foreground red "❌ Error: Couldn't install PHP $ver."
+            return 1
+        fi
         return 0
     fi
     if [ "$OS" != "macos" ] || [ "$MAC_BREW" != "brew" ]; then
@@ -31089,7 +31183,7 @@ cove_php_overview() {
             fi
         done
     fi
-    if [ "$OS" == "macos" ] && [ "$MAC_BREW" == "brew" ]; then
+    if [ "$OS" == "macos" ]; then
         echo ""
         local plist ver state found=false
         for plist in "$COVE_DIR"/com.cove.php-fpm-*.plist; do
